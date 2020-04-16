@@ -24,7 +24,7 @@ thread_local!(
     static ADDR: RefCell<Option<Arbiter>> = RefCell::new(None);
     static RUNNING: Cell<bool> = Cell::new(false);
     static Q: RefCell<Vec<Pin<Box<dyn Future<Output = ()>>>>> = RefCell::new(Vec::new());
-    static PENDING: RefCell<Vec<JoinHandle<()>>> = RefCell::new(Vec::new());
+    static PENDING: RefCell<i32> = RefCell::new(0);
     static STORAGE: RefCell<HashMap<TypeId, Box<dyn Any>>> = RefCell::new(HashMap::new());
 );
 
@@ -182,8 +182,14 @@ impl Arbiter {
             if cell.get() {
                 // Spawn the future on running executor
                 PENDING.with(move |cell| {
-                    cell.borrow_mut().push(tokio::task::spawn_local(future));
-                })
+                    *cell.borrow_mut() += 1;
+                });
+                tokio::task::spawn_local(async {
+                    future.await;
+                    PENDING.with(move |cell| {
+                        *cell.borrow_mut() -= 1;
+                    });
+                });
             } else {
                 // Box the future and push it to the queue, this results in double boxing
                 // because the executor boxes the future again, but works for now
@@ -310,9 +316,22 @@ impl Arbiter {
     /// Returns a future that will be completed once all currently spawned futures
     /// have completed.
     pub fn local_join() -> impl Future<Output = ()> {
+        LocalJoin
+    }
+}
+
+struct LocalJoin;
+
+impl Future for LocalJoin {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         PENDING.with(move |cell| {
-            let current = cell.replace(Vec::new());
-            future::join_all(current).map(|_| ())
+            if *cell.borrow() == 0 {
+                return Poll::Ready(());
+            }
+            ctx.waker().wake_by_ref();
+            Poll::Pending
         })
     }
 }
@@ -351,7 +370,13 @@ impl Future for ArbiterController {
                     }
                     ArbiterCommand::Execute(fut) => {
                         PENDING.with(move |cell| {
-                            cell.borrow_mut().push(tokio::task::spawn_local(fut));
+                            *cell.borrow_mut() += 1;
+                        });
+                        tokio::task::spawn_local(async {
+                            fut.await;
+                            PENDING.with(move |cell| {
+                                *cell.borrow_mut() -= 1;
+                            });
                         });
                     }
                     ArbiterCommand::ExecuteFn(f) => {
